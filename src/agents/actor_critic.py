@@ -4,6 +4,7 @@ import torch.optim as optim
 import numpy as np
 from typing import List, Tuple, Dict, Optional
 
+from ..utils.optimizers import *
 from ..environment.grid_world import GridWorld, Action
 
 
@@ -15,17 +16,25 @@ class ActorNetwork(nn.Module):
 
     def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 64):
         super(ActorNetwork, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, action_dim)
-        )
+        self.L0 = nn.Linear(state_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.L1 = nn.Linear(hidden_dim, hidden_dim)
+        self.L2 = nn.Linear(hidden_dim,action_dim)
 
     def forward(self, x: torch.Tensor) -> torch.distributions.Categorical:
-        logits = self.network(x)
+        x = self.L0(x)
+        x = self.act(x)
+        x = self.L1(x)
+        x = self.act(x)
+        logits = self.L2(x)
+
         return torch.distributions.Categorical(logits=logits)
+
+    def get_split_params(self):
+        adam_parameters = [p for p in self.L0.parameters()] + [p for p in self.L2.parameters()]
+        adam_parameters.append(self.L1.bias)
+        muon_paramters = [self.L1.weight]
+        return muon_paramters, adam_parameters
 
 
 class CriticNetwork(nn.Module):
@@ -36,16 +45,25 @@ class CriticNetwork(nn.Module):
 
     def __init__(self, state_dim: int, hidden_dim: int = 64):
         super(CriticNetwork, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+        self.L0 = nn.Linear(state_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.L1 = nn.Linear(hidden_dim, hidden_dim)
+        self.L2 = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.network(x)
+    def forward(self, x: torch.Tensor) -> torch.distributions.Categorical:
+        x = self.L0(x)
+        x = self.act(x)
+        x = self.L1(x)
+        x = self.act(x)
+        value = self.L2(x)
+
+        return value
+
+    def get_split_params(self):
+        adam_parameters = [p for p in self.L0.parameters()] + [p for p in self.L2.parameters()]
+        adam_parameters.append(self.L1.bias)
+        muon_paramters = [self.L1.weight]
+        return muon_paramters, adam_parameters
 
 
 class ActorCriticAgent:
@@ -59,7 +77,9 @@ class ActorCriticAgent:
                  learning_rate_actor: float = 0.0003,
                  learning_rate_critic: float = 0.001,
                  gamma: float = 0.99,
-                 entropy_coef: float = 0.01):
+                 entropy_coef: float = 0.01,
+                 momentum = .9,
+                 optimizer= "Adam"):
         """
         Initialize the Actor-Critic agent.
 
@@ -82,8 +102,79 @@ class ActorCriticAgent:
         self.critic = CriticNetwork(self.state_dim)
 
         # Initialize optimizers
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate_actor)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate_critic)
+        if optimizer == "SGD":
+            self.actor_optimizer = optim.SGD(self.actor.parameters(), momentum=momentum, lr=learning_rate_actor)
+            self.critic_optimizer = optim.SGD(self.critic.parameters(), momentum=momentum, lr=learning_rate_critic)
+
+        elif optimizer == "Adam":
+            self.actor_optimizer = optim.Adam(self.actor.parameters(), betas=(momentum,.999), lr=learning_rate_actor)
+            self.critic_optimizer = optim.Adam(self.critic.parameters(), betas=(momentum,.999), lr=learning_rate_critic)
+        elif optimizer == "Muon":
+            muon_params, aux_params = self.actor.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr= .02/3, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=3e-4, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.actor_optimizer = MuonWithAuxAdam(param_groups)
+
+            muon_params, aux_params = self.critic.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr=.02/3, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=3e-4, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.critic_optimizer = MuonWithAuxAdam(param_groups)
+        elif optimizer == "AdaMuon":
+            muon_params, aux_params = self.actor.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr= learning_rate_actor, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=learning_rate_actor, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.actor_optimizer = AdaMuonWithAuxAdam(param_groups)
+
+            muon_params, aux_params = self.critic.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr= learning_rate_critic, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=learning_rate_critic, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.critic_optimizer = AdaMuonWithAuxAdam(param_groups)
+        elif optimizer == "NorMuon":
+            muon_params, aux_params = self.actor.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr= learning_rate_actor, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=learning_rate_actor, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.actor_optimizer = SingleDeviceNorMuonWithAuxAdam(param_groups)
+
+            muon_params, aux_params = self.critic.get_split_params()
+            ns_steps = 5
+            param_groups = [
+                dict(params=muon_params, lr= learning_rate_critic, momentum=momentum,
+                     weight_decay=1e-4, use_muon=True, ns_steps=ns_steps),
+                dict(params=aux_params, lr=learning_rate_critic, momentum=momentum,
+                     weight_decay=1e-4, use_muon=False),
+            ]
+            self.critic_optimizer = AdaMuonWithAuxAdam(param_groups)
+        elif optimizer == "BGD":
+            print("BGD NOT YET IMPLIMENTED")
+            raise ValueError(f"BGD NOT YET IMPLIMENNTED")
+        else:
+            raise ValueError(f"Unknown optimizer: {optimizer}")
+
 
         # Training statistics
         self.episode_rewards: List[float] = []

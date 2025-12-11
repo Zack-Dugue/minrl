@@ -40,7 +40,8 @@ def run_actor_critic_demo():
         learning_rate_actor=0.0003,
         learning_rate_critic=0.001,
         gamma=0.99,
-        entropy_coef=0.01
+        entropy_coef=0.01,
+        optimizer="Muon"
     )
 
     # Train the agent
@@ -60,7 +61,7 @@ def run_actor_critic_demo():
         critic_losses=agent.critic_losses,
         title='Actor-Critic Training Progress'
     )
-    training_fig.show()
+    training_fig.savefig('Actor-Critic Training Progress')
 
     # Get and display the learned policy
     policy = agent.get_optimal_policy()
@@ -69,7 +70,7 @@ def run_actor_critic_demo():
         env.size,
         "Actor-Critic Learned Policy"
     )
-    policy_fig.show()
+    policy_fig.savefig("Actor-Critic Learned Policy")
 
     # Run and visualize a test episode
     print("\nRunning test episode with learned policy...")
@@ -91,7 +92,7 @@ def run_actor_critic_demo():
         episode_data,
         "Actor-Critic Test Episode Trajectory"
     )
-    episode_fig.show()
+    episode_fig.savefig("Actor-Critic Test Episode Trajectory")
 
     print(f"Test episode finished with total reward: {total_reward}")
 
