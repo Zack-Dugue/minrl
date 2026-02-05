@@ -9,6 +9,14 @@ from src.utils.visualization import Visualizer
 import torch
 import numpy as np
 import optuna
+import wandb
+
+# ───────────────────────── WandB config ─────────────────────────
+
+WANDB_PROJECT = "gridworld-actor-critic"   # <-- change if you like
+WANDB_ENTITY = None                        # e.g. "your_wandb_username" or team, or keep None
+
+wandb_run = None  # global handle so objective() can log
 
 
 # ───────────────────────── Helper: build env ─────────────────────────
@@ -95,7 +103,6 @@ def objective(trial: optuna.Trial) -> float:
     lr_critic = trial.suggest_float("learning_rate_critic", 1e-5, 1e-2, log=True)
     entropy_coef = trial.suggest_float("entropy_coef", 0.0, 0.05)
 
-    # You can optionally search over gamma too, but keeping it fixed for now.
     gamma = 0.99
 
     # Different seed per trial to avoid overfitting noise to one RNG draw
@@ -113,6 +120,20 @@ def objective(trial: optuna.Trial) -> float:
         seed=seed,
     )
 
+    # Log this trial to WandB (one point per trial)
+    global wandb_run
+    if wandb_run is not None:
+        wandb_run.log(
+            {
+                "trial": trial.number,
+                "learning_rate_actor": lr_actor,
+                "learning_rate_critic": lr_critic,
+                "entropy_coef": entropy_coef,
+                "mean_last_rewards": mean_last_rewards,
+            },
+            step=trial.number,
+        )
+
     return mean_last_rewards
 
 
@@ -122,10 +143,33 @@ def run_optuna_and_train_final(
     n_trials: int = 30,
     final_episodes: int = 2000,
     max_steps: int = 100,
+    use_wandb: bool = True,
 ):
+    global wandb_run
+
     # Global seed for reproducibility of the search process itself
     torch.manual_seed(42)
     np.random.seed(42)
+
+    # Init WandB once for the whole study
+    if use_wandb:
+        wandb_kwargs = dict(
+            project=WANDB_PROJECT,
+            name="optuna_gridworld_actor_critic",
+        )
+        if WANDB_ENTITY is not None:
+            wandb_kwargs["entity"] = WANDB_ENTITY
+        wandb_run = wandb.init(**wandb_kwargs)
+        wandb_run.config.update(
+            {
+                "n_trials": n_trials,
+                "final_episodes": final_episodes,
+                "max_steps": max_steps,
+                "gamma": 0.99,
+                "env_size": 9,
+                "optimizer": "Muon",
+            }
+        )
 
     print("Starting Optuna hyperparameter search...")
 
@@ -139,6 +183,19 @@ def run_optuna_and_train_final(
     best_lr_actor = study.best_params["learning_rate_actor"]
     best_lr_critic = study.best_params["learning_rate_critic"]
     best_entropy_coef = study.best_params["entropy_coef"]
+
+    # Explicit print of winning learning rates and entropy coefficient
+    print("\n=== Winning hyperparameters (Actor-Critic, GridWorld) ===")
+    print(f"Actor learning rate  : {best_lr_actor:.6g}")
+    print(f"Critic learning rate : {best_lr_critic:.6g}")
+    print(f"Entropy coefficient  : {best_entropy_coef:.6g}")
+
+    # Log best params to WandB summary
+    if wandb_run is not None:
+        wandb_run.summary["best_value"] = study.best_value
+        wandb_run.summary["best_learning_rate_actor"] = best_lr_actor
+        wandb_run.summary["best_learning_rate_critic"] = best_lr_critic
+        wandb_run.summary["best_entropy_coef"] = best_entropy_coef
 
     # Retrain with best hyperparameters on a longer run + full visualization
     print("\nRetraining final Actor-Critic agent with best hyperparameters...")
@@ -155,22 +212,35 @@ def run_optuna_and_train_final(
 
     print(f"Final run: mean reward over last 100 episodes = {mean_last_rewards:.3f}")
 
+    # Log final run curve to WandB (episode-level)
+    if wandb_run is not None:
+        for ep_idx, (r, l) in enumerate(zip(rewards, lengths)):
+            wandb_run.log(
+                {
+                    "final/reward": r,
+                    "final/length": l,
+                    "final/episode": ep_idx,
+                },
+                step=n_trials + ep_idx,
+            )
+        wandb_run.summary["final_mean_last_100"] = mean_last_rewards
+
     # Plot training curves
     training_fig = Visualizer.plot_training_results(
         rewards=rewards,
         lengths=lengths,
         actor_losses=agent.actor_losses,
         critic_losses=agent.critic_losses,
-        title='Actor-Critic Training Progress (Best Hyperparameters)'
+        title="Actor-Critic Training Progress (Best Hyperparameters)",
     )
-    training_fig.savefig('actor_critic_training_progress_best.png')
+    training_fig.savefig("actor_critic_training_progress_best.png")
 
     # Get and display the learned policy
     policy = agent.get_optimal_policy()
     policy_fig = Visualizer.plot_policy(
         policy,
         env.size,
-        "Actor-Critic Learned Policy (Best Hyperparameters)"
+        "Actor-Critic Learned Policy (Best Hyperparameters)",
     )
     policy_fig.savefig("actor_critic_learned_policy_best.png")
 
@@ -191,11 +261,21 @@ def run_optuna_and_train_final(
     episode_fig = Visualizer.visualize_episode_trajectory(
         env,
         episode_data,
-        "Actor-Critic Test Episode Trajectory (Best Hyperparameters)"
+        "Actor-Critic Test Episode Trajectory (Best Hyperparameters)",
     )
     episode_fig.savefig("actor_critic_test_episode_trajectory_best.png")
 
     print(f"Test episode finished with total reward: {total_reward}")
+
+    # Final print of winning hyperparameters (again, at the very end)
+    print("\n=== Final Winning Hyperparameters ===")
+    print(f"Actor learning rate  : {best_lr_actor:.6g}")
+    print(f"Critic learning rate : {best_lr_critic:.6g}")
+    print(f"Entropy coefficient  : {best_entropy_coef:.6g}")
+
+    if wandb_run is not None:
+        wandb_run.summary["test_total_reward"] = total_reward
+        wandb_run.finish()
 
     return agent, policy, total_reward, study
 
@@ -206,4 +286,5 @@ if __name__ == "__main__":
         n_trials=30,
         final_episodes=2000,
         max_steps=100,
+        use_wandb=True,
     )
